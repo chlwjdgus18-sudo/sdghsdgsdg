@@ -1,0 +1,608 @@
+name: Build APK
+
+# 이 파일 하나만 깃허브에 올리면 됩니다.
+# 올리면 자동으로 앱 소스를 만들고, APK를 빌드해서 Releases에 올려줍니다.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p gamedata-editor
+          cd gamedata-editor
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "GameDataEditor"
+          include(":app")
+          __EOF__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          __EOF__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.example.gamedataeditor"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.gamedataeditor"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- 설치된 앱(게임) 목록을 보여주기 위해 필요 -->
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="게임 데이터 편집기"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/gamedataeditor/RootShell.kt')"
+          cat > 'app/src/main/java/com/example/gamedataeditor/RootShell.kt' <<'__EOF__'
+          package com.example.gamedataeditor
+
+          /** su(루트) 명령 실행 도우미. 다른 앱의 /data/data 폴더는 루트 없이는 읽고 쓸 수 없습니다. */
+          object RootShell {
+              data class Result(val ok: Boolean, val out: String, val err: String)
+
+              fun run(cmd: String): Result = try {
+                  val p = ProcessBuilder("su", "-c", cmd).start()
+                  val out = p.inputStream.bufferedReader().readText()
+                  val err = p.errorStream.bufferedReader().readText()
+                  Result(p.waitFor() == 0, out, err)
+              } catch (e: Exception) {
+                  Result(false, "", e.message ?: "su 실행 실패")
+              }
+
+              fun isAvailable(): Boolean = run("id").out.contains("uid=0")
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/gamedataeditor/SaveScanner.kt')"
+          cat > 'app/src/main/java/com/example/gamedataeditor/SaveScanner.kt' <<'__EOF__'
+          package com.example.gamedataeditor
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.json.JSONTokener
+          import java.io.File
+
+          /** 저장 데이터 안에서 발견한 숫자 하나. */
+          data class SaveEntry(
+              val file: String,          // 예: /data/data/pkg/shared_prefs/game.xml
+              val path: List<String>,    // JSON 경로 (배열 인덱스는 "#2" 형태). XML은 키 하나
+              val type: String,          // int | long | float | json
+              val value: String,
+              val likely: Boolean,       // 돈/재화 같은 이름이면 true
+          ) {
+              val label: String
+                  get() = path.joinToString(".") { if (it.startsWith("#")) "[${it.substring(1)}]" else it }
+
+              val fileName: String get() = file.substringAfterLast('/')
+          }
+
+          data class ScanResult(val entries: List<SaveEntry>, val filesScanned: Int, val error: String? = null)
+
+          object SaveScanner {
+              private val pkgRegex = Regex("^[A-Za-z0-9._]+$")
+
+              private val currencyRegex = Regex(
+                  "(gold|coin|money|cash|gem|diamond|crystal|ruby|credit|currency|token|energy|ticket|" +
+                      "silver|jewel|dollar|point|star|stamina|heart|life|lives|exp|wood|stone|iron|food|" +
+                      "돈|골드|코인|재화|보석|다이아|크리스탈|티켓|에너지)",
+                  RegexOption.IGNORE_CASE,
+              )
+
+              private val xmlNumRegex = Regex("""<(int|long|float) name="([^"]*)" value="([^"]*)"\s*/>""")
+
+              fun scan(pkg: String): ScanResult {
+                  if (!pkgRegex.matches(pkg)) return ScanResult(emptyList(), 0, "잘못된 패키지 이름")
+
+                  val list = RootShell.run(
+                      "find /data/data/$pkg/shared_prefs /data/data/$pkg/files -type f -size -2048k 2>/dev/null",
+                  )
+                  val files = list.out.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                  if (files.isEmpty()) {
+                      return ScanResult(
+                          emptyList(), 0,
+                          if (list.ok || list.out.isNotBlank()) "읽을 수 있는 저장 파일이 없어요" else "루트 권한이 필요해요: ${list.err.trim()}",
+                      )
+                  }
+
+                  val entries = mutableListOf<SaveEntry>()
+                  var scanned = 0
+                  for (f in files) {
+                      val text = RootShell.run("cat '$f'").out
+                      val t = text.trimStart()
+                      when {
+                          t.startsWith("<") && t.contains("<map") -> {
+                              scanned++
+                              xmlNumRegex.findAll(text).forEach { m ->
+                                  val (type, rawName, value) = m.destructured
+                                  val name = unescapeXml(rawName)
+                                  entries += SaveEntry(f, listOf(name), type, value, currencyRegex.containsMatchIn(name))
+                              }
+                          }
+                          t.startsWith("{") || t.startsWith("[") -> {
+                              val root = try { JSONTokener(t).nextValue() } catch (e: Exception) { null }
+                              if (root != null) {
+                                  scanned++
+                                  collectJson(f, root, emptyList(), 0, entries)
+                              }
+                          }
+                      }
+                      if (entries.size > 3000) break
+                  }
+                  return ScanResult(entries, scanned)
+              }
+
+              private fun collectJson(file: String, node: Any?, path: List<String>, depth: Int, out: MutableList<SaveEntry>) {
+                  if (depth > 8 || out.size > 3000) return
+                  when (node) {
+                      is JSONObject -> node.keys().forEach { k -> collectJson(file, node.opt(k), path + k, depth + 1, out) }
+                      is JSONArray -> for (i in 0 until minOf(node.length(), 200)) {
+                          collectJson(file, node.opt(i), path + "#$i", depth + 1, out)
+                      }
+                      is Int, is Long, is Double -> if (path.isNotEmpty()) {
+                          val label = path.joinToString(".")
+                          out += SaveEntry(file, path, "json", node.toString(), currencyRegex.containsMatchIn(label))
+                      }
+                  }
+              }
+
+              /** 새 값을 저장. 게임을 먼저 강제 종료해야 종료 시 덮어쓰기를 막을 수 있어요. */
+              fun write(pkg: String, entry: SaveEntry, newValue: String, cacheDir: File): Result<Unit> = runCatching {
+                  require(pkgRegex.matches(pkg)) { "잘못된 패키지 이름" }
+                  val v = newValue.trim()
+
+                  RootShell.run("am force-stop $pkg")
+                  val original = RootShell.run("cat '${entry.file}'")
+                  require(original.out.isNotEmpty()) { "파일을 읽지 못했어요 (루트 권한 확인)" }
+
+                  val updated = if (entry.type == "json") {
+                      updateJson(original.out, entry, v)
+                  } else {
+                      updateXml(original.out, entry, v)
+                  }
+
+                  val tmp = File(cacheDir, "edit.tmp")
+                  tmp.writeText(updated)
+                  // cat > 로 덮어쓰면 원본 파일의 소유자/권한/SELinux 라벨이 그대로 유지돼요.
+                  val res = RootShell.run("cat '${tmp.absolutePath}' > '${entry.file}'")
+                  tmp.delete()
+                  require(res.ok) { "저장 실패: ${res.err.trim()}" }
+              }
+
+              private fun updateXml(text: String, e: SaveEntry, v: String): String {
+                  when (e.type) {
+                      "int" -> requireNotNull(v.toIntOrNull()) { "정수 범위(±2,147,483,647)를 넘었어요" }
+                      "long" -> requireNotNull(v.toLongOrNull()) { "정수가 아니에요" }
+                      "float" -> requireNotNull(v.toFloatOrNull()) { "숫자가 아니에요" }
+                  }
+                  val re = Regex("""(<${e.type} name="${Regex.escape(escapeXml(e.path[0]))}" value=")[^"]*("\s*/>)""")
+                  require(re.containsMatchIn(text)) { "파일에서 항목을 찾지 못했어요" }
+                  return text.replaceFirst(re) { it.groupValues[1] + v + it.groupValues[2] }
+              }
+
+              private fun updateJson(text: String, e: SaveEntry, v: String): String {
+                  val num: Number = if (e.value.contains('.') || e.value.contains('e', true)) {
+                      requireNotNull(v.toDoubleOrNull()) { "숫자가 아니에요" }
+                  } else {
+                      requireNotNull(v.toLongOrNull()) { "정수가 아니에요" }
+                  }
+                  val root = JSONTokener(text.trimStart()).nextValue()
+                  var cur: Any = root
+                  for (seg in e.path.dropLast(1)) {
+                      cur = if (seg.startsWith("#")) (cur as JSONArray).get(seg.substring(1).toInt())
+                      else (cur as JSONObject).get(seg)
+                  }
+                  val last = e.path.last()
+                  if (last.startsWith("#")) (cur as JSONArray).put(last.substring(1).toInt(), num)
+                  else (cur as JSONObject).put(last, num)
+                  return root.toString()
+              }
+
+              private fun unescapeXml(s: String) =
+                  s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+
+              private fun escapeXml(s: String) =
+                  s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/example/gamedataeditor/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/gamedataeditor/MainActivity.kt' <<'__EOF__'
+          package com.example.gamedataeditor
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.ListItem
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          data class GameApp(val label: String, val pkg: String, val isGame: Boolean)
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+                          App()
+                      }
+                  }
+              }
+          }
+
+          private fun loadGames(ctx: Context): List<GameApp> {
+              val pm = ctx.packageManager
+              val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+              return pm.queryIntentActivities(intent, 0)
+                  .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                  .distinctBy { it.first }
+                  .filter { it.first != ctx.packageName }
+                  .map { (pkg, label) ->
+                      val info = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
+                      @Suppress("DEPRECATION")
+                      val isGame = info != null && (
+                          info.category == ApplicationInfo.CATEGORY_GAME ||
+                              (info.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                          )
+                      GameApp(label, pkg, isGame)
+                  }
+                  .sortedWith(compareByDescending<GameApp> { it.isGame }.thenBy { it.label.lowercase() })
+          }
+
+          @Composable
+          fun App() {
+              var selected by remember { mutableStateOf<GameApp?>(null) }
+              val game = selected
+              if (game == null) {
+                  GameListScreen(onPick = { selected = it })
+              } else {
+                  BackHandler { selected = null }
+                  EntryScreen(game = game, onBack = { selected = null })
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun GameListScreen(onPick: (GameApp) -> Unit) {
+              val ctx = LocalContext.current
+              var games by remember { mutableStateOf<List<GameApp>?>(null) }
+              var query by remember { mutableStateOf("") }
+              var onlyGames by remember { mutableStateOf(false) }
+
+              LaunchedEffect(Unit) { games = withContext(Dispatchers.IO) { loadGames(ctx) } }
+
+              Scaffold(topBar = { TopAppBar(title = { Text("게임 선택") }) }) { pad ->
+                  Column(Modifier.padding(pad).fillMaxSize()) {
+                      OutlinedTextField(
+                          value = query,
+                          onValueChange = { query = it },
+                          label = { Text("검색") },
+                          singleLine = true,
+                          modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                      )
+                      Row(Modifier.padding(horizontal = 16.dp)) {
+                          FilterChip(
+                              selected = onlyGames,
+                              onClick = { onlyGames = !onlyGames },
+                              label = { Text("게임으로 표시된 앱만") },
+                          )
+                      }
+                      val all = games
+                      if (all == null) {
+                          Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                              CircularProgressIndicator()
+                          }
+                      } else {
+                          val shown = all.filter {
+                              (!onlyGames || it.isGame) &&
+                                  (query.isBlank() || it.label.contains(query, true) || it.pkg.contains(query, true))
+                          }
+                          LazyColumn {
+                              items(shown, key = { it.pkg }) { g ->
+                                  ListItem(
+                                      headlineContent = { Text(g.label) },
+                                      supportingContent = { Text(g.pkg) },
+                                      modifier = Modifier.clickable { onPick(g) },
+                                  )
+                                  HorizontalDivider()
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun EntryScreen(game: GameApp, onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val snack = remember { SnackbarHostState() }
+
+              var loading by remember { mutableStateOf(true) }
+              var rootOk by remember { mutableStateOf(true) }
+              var result by remember { mutableStateOf(ScanResult(emptyList(), 0)) }
+              var showAll by remember { mutableStateOf(false) }
+              var editing by remember { mutableStateOf<SaveEntry?>(null) }
+              var reload by remember { mutableStateOf(0) }
+
+              LaunchedEffect(game.pkg, reload) {
+                  loading = true
+                  withContext(Dispatchers.IO) {
+                      rootOk = RootShell.isAvailable()
+                      result = if (rootOk) SaveScanner.scan(game.pkg) else ScanResult(emptyList(), 0)
+                  }
+                  loading = false
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text(game.label) },
+                          navigationIcon = {
+                              IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로") }
+                          },
+                      )
+                  },
+                  snackbarHost = { SnackbarHost(snack) },
+              ) { pad ->
+                  Column(Modifier.padding(pad).fillMaxSize()) {
+                      when {
+                          loading -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                              CircularProgressIndicator()
+                              Text("저장 데이터 분석 중…", Modifier.padding(top = 12.dp))
+                          }
+                          !rootOk -> Text(
+                              "루트 권한을 얻지 못했어요.\n다른 앱의 저장 데이터는 루트(su) 권한이 있어야 읽고 수정할 수 있어요. 루트가 허용된 기기에서 다시 시도해 주세요.",
+                              Modifier.padding(16.dp),
+                          )
+                          else -> {
+                              val shown = result.entries.filter { showAll || it.likely }
+                              Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  FilterChip(selected = showAll, onClick = { showAll = !showAll }, label = { Text("모든 숫자 보기") })
+                                  Text("  ${shown.size}개 / 파일 ${result.filesScanned}개 분석", style = MaterialTheme.typography.bodySmall)
+                              }
+                              result.error?.let { Text(it, Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.error) }
+                              if (shown.isEmpty() && result.error == null) {
+                                  Text(
+                                      "재화로 보이는 항목을 찾지 못했어요. '모든 숫자 보기'를 켜 보세요.\n(암호화·바이너리 저장 방식의 게임은 감지할 수 없어요.)",
+                                      Modifier.padding(16.dp),
+                                  )
+                              }
+                              LazyColumn {
+                                  items(shown) { e ->
+                                      ListItem(
+                                          headlineContent = { Text(e.label) },
+                                          supportingContent = { Text(e.fileName) },
+                                          trailingContent = { Text(e.value, style = MaterialTheme.typography.titleMedium) },
+                                          modifier = Modifier.clickable { editing = e },
+                                      )
+                                      HorizontalDivider()
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              editing?.let { entry ->
+                  EditDialog(
+                      entry = entry,
+                      onDismiss = { editing = null },
+                      onSave = { newValue ->
+                          editing = null
+                          scope.launch {
+                              val r = withContext(Dispatchers.IO) { SaveScanner.write(game.pkg, entry, newValue, ctx.cacheDir) }
+                              snack.showSnackbar(
+                                  r.fold(
+                                      onSuccess = { "저장했어요. 게임을 다시 실행해 확인하세요." },
+                                      onFailure = { "실패: ${it.message}" },
+                                  ),
+                              )
+                              reload++
+                          }
+                      },
+                  )
+              }
+          }
+
+          @Composable
+          fun EditDialog(entry: SaveEntry, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+              var text by remember { mutableStateOf(entry.value) }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(entry.label) },
+                  text = {
+                      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Text("현재 값: ${entry.value}", style = MaterialTheme.typography.bodySmall)
+                          OutlinedTextField(
+                              value = text,
+                              onValueChange = { text = it.filter { c -> c.isDigit() || c == '-' || c == '.' } },
+                              singleLine = true,
+                              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                              modifier = Modifier.fillMaxWidth(),
+                          )
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedButton(onClick = { text = "999999999" }) { Text("9억9천만") }
+                              OutlinedButton(onClick = {
+                                  text = ((text.toLongOrNull() ?: 0L) + 1000L).toString()
+                              }) { Text("+1,000") }
+                          }
+                          Text(
+                              "저장할 때 게임이 강제 종료돼요. 원본이 걱정되면 미리 백업하세요.",
+                              style = MaterialTheme.typography.bodySmall,
+                          )
+                      }
+                  },
+                  confirmButton = { Button(onClick = { onSave(text) }, enabled = text.isNotBlank()) { Text("저장") } },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("취소") } },
+              )
+          }
+          __EOF__
+
+      - name: Build debug APK
+        working-directory: gamedata-editor
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp gamedata-editor/app/build/outputs/apk/debug/app-debug.apk GameDataEditor.apk
+          gh release create "build-${{ github.run_number }}" GameDataEditor.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "GameDataEditor build ${{ github.run_number }}" \
+            --notes "Download GameDataEditor.apk and install it on your phone."
